@@ -90,4 +90,32 @@
 		reg-shift = <2>;
 		status = "disabled";
 	};
+
+	usb2phy0_grf: syscon@fd5d0000 {
+		compatible = "syscon";
+		reg = <0xfd5d0000 0x1000>;
+		status = "okay";
+	};
+
+	usbdpphy0_grf: syscon@fd5c8000 {
+		compatible = "syscon";
+		reg = <0xfd5c8000 0x1000>;
+		status = "okay";
+	};
+
+	zephyr_udc0: usb@fc000000 {
+		compatible = "rockchip,rk3588-dwc3", "snps,dwc3";
+		reg = <0xfc000000 0x400000>;
+		reg-names = "base";
+		maximum-speed = "high-speed";
+		num-bidir-endpoints = <16>;
+		num-in-endpoints = <1>;
+		num-out-endpoints = <1>;
+		interrupts = <GIC_SPI 220 IRQ_TYPE_LEVEL IRQ_DEFAULT_PRIORITY>;
+		interrupt-names = "usb";
+		interrupt-parent = <&gic>;
+		usb2phy-grf = <&usb2phy0_grf>;
+		usb3phy-grf = <&usbdpphy0_grf>;
+		status = "disabled";
+	};
 };

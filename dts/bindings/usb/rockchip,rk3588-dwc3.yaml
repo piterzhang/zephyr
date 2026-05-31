@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: Copyright The Zephyr Project Contributors
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+    Rockchip RK3588 DWC3 USB controller
+
+compatible: "rockchip,rk3588-dwc3"
+
+include: snps,dwc3.yaml
+
+properties:
+  usb2phy-grf:
+    type: phandle
+    description: |
+      Phandle to the syscon node for USB2 PHY GRF registers.
+
+  usb3phy-grf:
+    type: phandle
+    description: |
+      Phandle to the syscon node for USB3 DP PHY GRF registers.
