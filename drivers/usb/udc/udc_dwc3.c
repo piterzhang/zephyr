@@ -618,7 +618,14 @@ struct udc_dwc3_vendor_quirks {
 #define UDC_DWC3_QUIRK_CFG(dev)  (((const struct udc_dwc3_config *)(dev->config))->quirk_config)
 #define UDC_DWC3_QUIRK_DATA(dev) (((const struct udc_dwc3_config *)(dev->config))->quirk_data)
 
-#if DT_HAS_COMPAT_STATUS_OKAY(snps_dwc3 /* <- replace with your more specific compatible */)
+#define DEV_CFG(dev)  ((const struct udc_dwc3_config *)(dev->config))
+#define DEV_DATA(dev) ((struct udc_dwc3_data *)udc_get_private(dev))
+
+#define UDC_DWC3_GUSB2PHYCFG_U2_FREECLK_EXISTS BIT(30)
+
+#if DT_HAS_COMPAT_STATUS_OKAY(rockchip_rk3588_dwc3)
+#include "udc_dwc3_rk3588.h"
+#elif DT_HAS_COMPAT_STATUS_OKAY(snps_dwc3 /* <- replace with your more specific compatible */)
 #include "udc_dwc3_qemu.h"
 #endif
 
@@ -638,9 +645,6 @@ UDC_DWC3_QUIRK_FUNC_DEFINE(init);
 UDC_DWC3_QUIRK_FUNC_DEFINE(enable);
 UDC_DWC3_QUIRK_FUNC_DEFINE(disable);
 UDC_DWC3_QUIRK_FUNC_DEFINE(shutdown);
-
-#define DEV_CFG(dev) ((const struct udc_dwc3_config *)(dev->config))
-#define DEV_DATA(dev) ((struct udc_dwc3_data *)udc_get_private(dev))
 
 static int udc_dwc3_set_address(const struct device *const dev, const uint8_t addr);
 static int udc_dwc3_ep_disable(const struct device *const dev, struct udc_ep_config *const ep_cfg);
