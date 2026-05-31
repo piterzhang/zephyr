@@ -1,0 +1,91 @@
+/*
+ * Copyright (C) 2020 Rockchip Electronic Co.,Ltd
+ *
+ * Simple U-boot fit source file containing ATF/OP-TEE/U-Boot/dtb/MCU
+ */
+
+/dts-v1/;
+
+/ {
+        description = "FIT Image with ATF/OP-TEE/rt-thread/MCU";
+        #address-cells = <1>;
+
+        images {
+
+                uboot {
+                        description = "U-Boot";
+                        data = /incbin/("./zephyr.bin");
+                        type = "standalone";
+                        arch = "arm64";
+                        os = "u-boot";
+                        compression = "none";
+                        load = <0x50000000>;
+                        hash {
+                                algo = "sha256";
+                        };
+                };
+                atf-1 {
+                        description = "ARM Trusted Firmware";
+                        data = /incbin/("./bl31_0x00040000.bin");
+                        type = "firmware";
+                        arch = "arm64";
+                        os = "arm-trusted-firmware";
+                        compression = "none";
+                        load = <0x00040000>;
+                        hash {
+                                algo = "sha256";
+                        };
+                };
+                atf-2 {
+                        description = "ARM Trusted Firmware";
+                        data = /incbin/("./bl31_0xff100000.bin");
+                        type = "firmware";
+                        arch = "arm64";
+                        os = "arm-trusted-firmware";
+                        compression = "none";
+                        load = <0xff100000>;
+                        hash {
+                                algo = "sha256";
+                        };
+                };
+                atf-3 {
+                        description = "ARM Trusted Firmware";
+                        data = /incbin/("./bl31_0x000f0000.bin");
+                        type = "firmware";
+                        arch = "arm64";
+                        os = "arm-trusted-firmware";
+                        compression = "none";
+                        load = <0x000f0000>;
+                        hash {
+                                algo = "sha256";
+                        };
+                };
+                fdt {
+                        description = "U-Boot dtb";
+                        data = /incbin/("./u-boot.dtb");
+                        type = "flat_dt";
+                        arch = "arm64";
+                        compression = "none";
+                        hash {
+                                algo = "sha256";
+                        };
+                };
+        };
+
+        configurations {
+                default = "conf";
+                conf {
+                        description = "rk3588-rock-5b";
+                        rollback-index = <0x0>;
+                        firmware = "atf-1";
+                        loadables = "uboot", "atf-2", "atf-3";
+                        fdt = "fdt";
+                        signature {
+                                                                algo = "sha256,rsa2048";
+
+                                key-name-hint = "dev";
+                                sign-images = "firmware", "loadables", "fdt";
+                        };
+                };
+        };
+};

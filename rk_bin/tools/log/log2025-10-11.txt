@@ -1,0 +1,15 @@
+07:19:33 	Error: failed to stat config.ini, err=2
+07:20:44 	Error: failed to stat config.ini, err=2
+07:21:26 	Error: failed to stat config.ini, err=2
+07:23:05 	Error: failed to stat config.ini, err=2
+07:29:43 	Error: failed to stat config.ini, err=2
+07:30:03 	Error: failed to stat config.ini, err=2
+07:30:23 	Error: failed to stat config.ini, err=2
+07:30:32 	Error: failed to stat config.ini, err=2
+07:31:29 	Error: failed to stat config.ini, err=2
+07:31:36 	Error: failed to stat config.ini, err=2
+07:31:43 	Error: failed to stat config.ini, err=2
+07:32:24 	Error: failed to stat config.ini, err=2
+07:32:35 	Error: failed to stat config.ini, err=2
+07:34:21 	Error: failed to stat config.ini, err=2
+07:34:32 	Error: failed to stat config.ini, err=2
