@@ -265,7 +265,9 @@ int scmi_clock_attributes(struct scmi_protocol *proto, uint32_t clk_id,
 	msg.content = &clk_id;
 
 	reply.hdr = msg.hdr;
-	reply.len = sizeof(*attributes);
+	reply.len = SCMI_PROTO_VER_MAJOR(proto->version) >= 3
+			    ? sizeof(struct scmi_clock_attributes_v3)
+			    : sizeof(struct scmi_clock_attributes_v2);
 	reply.content = attributes;
 
 	ret = scmi_send_message(proto, &msg, &reply, false);

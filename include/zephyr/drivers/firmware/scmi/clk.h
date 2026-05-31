@@ -35,6 +35,22 @@
 
 #define SCMI_CLK_PROTOCOL_SUPPORTED_VERSION	0x30000
 
+/**
+ * @brief Extract major version from SCMI protocol version
+ *
+ * @param v Combined 32-bit protocol version (major << 16 | minor)
+ * @return Major version number
+ */
+#define SCMI_PROTO_VER_MAJOR(v) ((v) >> 16)
+
+/**
+ * @brief Extract minor version from SCMI protocol version
+ *
+ * @param v Combined 32-bit protocol version (major << 16 | minor)
+ * @return Minor version number
+ */
+#define SCMI_PROTO_VER_MINOR(v) ((v) & 0xFFFF)
+
 /** clock name length (short version) */
 #define SCMI_CLK_NAME_LEN 16
 
@@ -72,9 +88,41 @@ struct scmi_clock_rate_config {
 };
 
 /**
- * @struct scmi_clock_attributes
+ * @struct scmi_clock_attributes_v2
  *
  * @brief Describes the content of the CLOCK_ATTRIBUTES command reply
+ *        (protocol version < 3.0)
+ */
+struct scmi_clock_attributes_v2 {
+	/** reply status */
+	int32_t status;
+	/** clock attributes */
+	uint32_t attributes;
+	/** clock name */
+	uint8_t clock_name[SCMI_CLK_NAME_LEN];
+} __packed;
+
+/**
+ * @struct scmi_clock_attributes_v3
+ *
+ * @brief Describes the content of the CLOCK_ATTRIBUTES command reply
+ *        (protocol version >= 3.0)
+ */
+struct scmi_clock_attributes_v3 {
+	/** reply status */
+	int32_t status;
+	/** clock attributes */
+	uint32_t attributes;
+	/** clock name */
+	uint8_t clock_name[SCMI_CLK_NAME_LEN];
+	/** clock enable delay incurred by platform */
+	uint32_t clock_enable_delay;
+} __packed;
+
+/**
+ * @struct scmi_clock_attributes
+ *
+ * @brief Generic CLOCK_ATTRIBUTES reply (use with scmi_clock_attributes())
  */
 struct scmi_clock_attributes {
 	/** reply status */
@@ -83,7 +131,7 @@ struct scmi_clock_attributes {
 	uint32_t attributes;
 	/** clock name */
 	uint8_t clock_name[SCMI_CLK_NAME_LEN];
-	/** clock enable delay incurred by platform */
+	/** clock enable delay incurred by platform (valid only for protocol v3.0+) */
 	uint32_t clock_enable_delay;
 } __packed;
 

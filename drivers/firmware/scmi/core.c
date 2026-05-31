@@ -183,12 +183,17 @@ static int scmi_core_protocol_negotiate(struct scmi_protocol *proto)
 		return ret;
 	}
 
-	if (platform_version > agent_version) {
+	if (platform_version <= agent_version) {
+		proto->version = platform_version;
+	} else {
 		ret = scmi_protocol_version_negotiate(proto, agent_version);
-		if (ret < 0) {
+		if (ret == 0) {
+			proto->version = agent_version;
+		} else {
+			/* proto->version keep into agent_version, not return error */
 			LOG_WRN("Protocol 0x%X: Negotiation failed (%d). "
-				"Platform v0x%08x does not support downgrade to agent v0x%08x",
-				proto->id, ret, platform_version, agent_version);
+				"Using agent version 0x%08x (compat NOT assured)",
+				proto->id, ret, agent_version);
 		}
 	}
 
