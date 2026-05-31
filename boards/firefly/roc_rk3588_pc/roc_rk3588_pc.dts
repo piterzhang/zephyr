@@ -57,3 +57,9 @@
 &ptp_clock0 {
 	status = "okay";
 };
+
+&zephyr_udc0 {
+	num-in-endpoints = <3>;
+	num-out-endpoints = <2>;
+	status = "okay";
+};
