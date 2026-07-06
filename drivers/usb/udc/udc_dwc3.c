@@ -1040,6 +1040,20 @@ static void udc_dwc3_next_ctrl_out(const struct device *const dev,
 	}
 }
 
+static bool udc_dwc3_ctrl_status_out_waiting_data_in(const struct device *const dev,
+						     struct udc_dwc3_ep_data *const ep_data,
+						     struct net_buf *const buf)
+{
+	const struct udc_dwc3_config *const cfg = dev->config;
+	struct udc_buf_info *const bi = udc_get_buf_info(buf);
+
+	if (ep_data->cfg.addr != USB_CONTROL_EP_OUT || !bi->status) {
+		return false;
+	}
+
+	return udc_ep_is_busy(&cfg->ep_data_in[0].cfg);
+}
+
 static void udc_dwc3_next_ctrl(const struct device *const dev,
 			       struct udc_dwc3_ep_data *const ep_data)
 {
@@ -1051,6 +1065,13 @@ static void udc_dwc3_next_ctrl(const struct device *const dev,
 
 	buf = udc_buf_peek(&ep_data->cfg);
 	if (buf == NULL) {
+		return;
+	}
+
+	/* STATUS OUT belongs to the control-read sequence and must not be
+	 * armed before the DATA IN stage has completed.
+	 */
+	if (udc_dwc3_ctrl_status_out_waiting_data_in(dev, ep_data, buf)) {
 		return;
 	}
 
@@ -1346,6 +1367,7 @@ static void udc_dwc3_on_ctrl_in(const struct device *const dev)
 	/* Used when receiving a completed buffer from the hardware: mark as free */
 	udc_ep_set_busy(&ep_data->cfg, false);
 
+	udc_dwc3_next_ctrl(dev, &cfg->ep_data_out[0]);
 	udc_dwc3_next_ctrl(dev, ep_data);
 }
 
