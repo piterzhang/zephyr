@@ -536,6 +536,10 @@ struct udc_dwc3_data {
 	DEVICE_MMIO_NAMED_RAM(base);
 	/* Index within trb where to queue new TRBs */
 	uint32_t evt_next;
+	/* Process completed control SETUP requests outside interrupt context. */
+	struct k_work setup_work;
+	/* Serialize control transfers submitted from IRQ and thread context. */
+	struct k_spinlock ctrl_lock;
 	/* Back-reference to parent */
 	const struct device *dev;
 };
@@ -699,9 +703,11 @@ static struct net_buf *udc_dwc3_pop_trb(const struct device *const dev,
  */
 
 static uint32_t udc_dwc3_depcmd(const struct device *const dev,
-				const uint32_t addr, const uint32_t cmd)
+				struct udc_dwc3_ep_data *const ep_data,
+				const uint32_t cmd)
 {
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+	const uint32_t addr = UDC_DWC3_DEPCMD(ep_data->epn);
 	uint32_t reg;
 
 	sys_write32(cmd | UDC_DWC3_DEPCMD_CMDACT, base + addr);
@@ -713,7 +719,12 @@ static uint32_t udc_dwc3_depcmd(const struct device *const dev,
 	case UDC_DWC3_DEPCMD_STATUS_OK:
 		break;
 	case UDC_DWC3_DEPCMD_STATUS_CMDERR:
-		LOG_ERR("endpoint command failed");
+		LOG_ERR("endpoint command failed: ep=0x%02x phys=%d cmd=0x%08x "
+			"result=0x%08x par2=0x%08x par1=0x%08x par0=0x%08x",
+			ep_data->cfg.addr, ep_data->epn, cmd, reg,
+			sys_read32(base + UDC_DWC3_DEPCMDPAR2(ep_data->epn)),
+			sys_read32(base + UDC_DWC3_DEPCMDPAR1(ep_data->epn)),
+			sys_read32(base + UDC_DWC3_DEPCMDPAR0(ep_data->epn)));
 		break;
 	default:
 		LOG_ERR("command failed with unknown status: 0x%08x", reg);
@@ -781,7 +792,7 @@ static void udc_dwc3_depcmd_ep_config(const struct device *const dev,
 	sys_write32(param0, base + UDC_DWC3_DEPCMDPAR0(ep_data->epn));
 	sys_write32(param1, base + UDC_DWC3_DEPCMDPAR1(ep_data->epn));
 
-	udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), UDC_DWC3_DEPCMD_DEPCFG);
+	udc_dwc3_depcmd(dev, ep_data, UDC_DWC3_DEPCMD_DEPCFG);
 }
 
 static void udc_dwc3_depcmd_ep_xfer_config(const struct device *const dev,
@@ -794,7 +805,7 @@ static void udc_dwc3_depcmd_ep_xfer_config(const struct device *const dev,
 
 	reg = FIELD_PREP(UDC_DWC3_DEPCMDPAR0_DEPXFERCFG_NUMXFERRES_MASK, 1);
 	sys_write32(reg, base + UDC_DWC3_DEPCMDPAR0(ep_data->epn));
-	udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), UDC_DWC3_DEPCMD_DEPXFERCFG);
+	udc_dwc3_depcmd(dev, ep_data, UDC_DWC3_DEPCMD_DEPXFERCFG);
 }
 
 static void udc_dwc3_depcmd_set_stall(const struct device *const dev,
@@ -802,7 +813,7 @@ static void udc_dwc3_depcmd_set_stall(const struct device *const dev,
 {
 	LOG_WRN("DepSetStall: ep=0x%02x", ep_data->cfg.addr);
 
-	udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), UDC_DWC3_DEPCMD_DEPSETSTALL);
+	udc_dwc3_depcmd(dev, ep_data, UDC_DWC3_DEPCMD_DEPSETSTALL);
 }
 
 static void udc_dwc3_depcmd_clear_stall(const struct device *const dev,
@@ -810,7 +821,7 @@ static void udc_dwc3_depcmd_clear_stall(const struct device *const dev,
 {
 	LOG_INF("DepClearStall ep=0x%02x", ep_data->cfg.addr);
 
-	udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), UDC_DWC3_DEPCMD_DEPCSTALL);
+	udc_dwc3_depcmd(dev, ep_data, UDC_DWC3_DEPCMD_DEPCSTALL);
 }
 
 static void udc_dwc3_depcmd_start_xfer(const struct device *const dev,
@@ -829,7 +840,7 @@ static void udc_dwc3_depcmd_start_xfer(const struct device *const dev,
 	sys_write32(LO32((uintptr_t)ep_data->trb_buf), base + UDC_DWC3_DEPCMDPAR1(ep_data->epn));
 
 	ep_data->xferrscidx =
-		udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), UDC_DWC3_DEPCMD_DEPSTRTXFER);
+		udc_dwc3_depcmd(dev, ep_data, UDC_DWC3_DEPCMD_DEPSTRTXFER);
 
 	LOG_DBG("DepStartXfer done ep=0x%02x xferrscidx=0x%x",
 		ep_data->cfg.addr, ep_data->xferrscidx);
@@ -843,7 +854,7 @@ static void udc_dwc3_depcmd_update_xfer(const struct device *const dev,
 	flags |= UDC_DWC3_DEPCMD_DEPUPDXFER;
 	flags |= FIELD_PREP(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, ep_data->xferrscidx);
 
-	udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), flags);
+	udc_dwc3_depcmd(dev, ep_data, flags);
 
 	LOG_DBG("DepUpdateXfer done ep=0x%02x addr=0x%08x data=0x%08x",
 		ep_data->cfg.addr, UDC_DWC3_DEPCMD(ep_data->epn), flags);
@@ -856,7 +867,7 @@ static void udc_dwc3_depcmd_end_xfer(const struct device *const dev,
 	flags |= FIELD_PREP(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, ep_data->xferrscidx);
 	flags |= UDC_DWC3_DEPCMD_DEPENDXFER;
 
-	udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), flags);
+	udc_dwc3_depcmd(dev, ep_data, flags);
 
 	LOG_DBG("DepEndXfer done ep=0x%02x", ep_data->cfg.addr);
 
@@ -872,7 +883,7 @@ static void udc_dwc3_depcmd_start_config(const struct device *const dev,
 	flags |= FIELD_PREP(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, is_control ? 0 : 2);
 	flags |= UDC_DWC3_DEPCMD_DEPSTARTCFG;
 
-	udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), flags);
+	udc_dwc3_depcmd(dev, ep_data, flags);
 
 	LOG_DBG("DepStartConfig done ep=0x%02x", ep_data->cfg.addr);
 }
@@ -1057,22 +1068,26 @@ static bool udc_dwc3_ctrl_status_out_waiting_data_in(const struct device *const 
 static void udc_dwc3_next_ctrl(const struct device *const dev,
 			       struct udc_dwc3_ep_data *const ep_data)
 {
+	struct udc_dwc3_data *const priv = DEV_DATA(dev);
+	k_spinlock_key_t key;
 	struct net_buf *buf;
 
+	key = k_spin_lock(&priv->ctrl_lock);
+
 	if (udc_ep_is_busy(&ep_data->cfg)) {
-		return;
+		goto unlock;
 	}
 
 	buf = udc_buf_peek(&ep_data->cfg);
 	if (buf == NULL) {
-		return;
+		goto unlock;
 	}
 
 	/* STATUS OUT belongs to the control-read sequence and must not be
 	 * armed before the DATA IN stage has completed.
 	 */
 	if (udc_dwc3_ctrl_status_out_waiting_data_in(dev, ep_data, buf)) {
-		return;
+		goto unlock;
 	}
 
 	udc_ep_set_busy(&ep_data->cfg, true);
@@ -1082,6 +1097,9 @@ static void udc_dwc3_next_ctrl(const struct device *const dev,
 	} else {
 		udc_dwc3_next_ctrl_out(dev, buf);
 	}
+
+unlock:
+	k_spin_unlock(&priv->ctrl_lock, key);
 }
 
 /*
@@ -1371,6 +1389,20 @@ static void udc_dwc3_on_ctrl_in(const struct device *const dev)
 	udc_dwc3_next_ctrl(dev, ep_data);
 }
 
+static void udc_dwc3_setup_worker(struct k_work *const work)
+{
+	struct udc_dwc3_data *const priv =
+		CONTAINER_OF(work, struct udc_dwc3_data, setup_work);
+	const struct device *const dev = priv->dev;
+
+	/*
+	 * udc_setup_received() takes the UDC mutex and requires thread context.
+	 * The USB stack will enqueue and start the next control stage after it
+	 * consumes this completion; starting it here would race that enqueue path.
+	 */
+	udc_setup_received(dev, NULL);
+}
+
 /*
  * Handle completion of a CONTROL OUT packet (host -> device).
  *
@@ -1411,8 +1443,14 @@ static void udc_dwc3_on_ctrl_out(const struct device *const dev)
 
 		LOG_HEXDUMP_DBG(buf->data, buf->len, "SETUP received");
 
-		/* The buffer will directly be taken from the UDC queue */
-		udc_setup_received(dev, NULL);
+		/*
+		 * udc_setup_received() uses the UDC mutex and must not run in this
+		 * interrupt handler. Keep the completed SETUP buffer queued and do
+		 * not re-arm EP0 OUT until the worker has consumed it.
+		 */
+		udc_ep_set_busy(&ep_data->cfg, false);
+		(void)k_work_submit_to_queue(udc_get_work_q(), &DEV_DATA(dev)->setup_work);
+		return;
 	} else {
 		buf = udc_buf_get(&ep_data->cfg);
 		if (buf == NULL) {
@@ -1929,6 +1967,7 @@ static int udc_dwc3_driver_preinit(const struct device *const dev)
 	DEVICE_MMIO_NAMED_MAP(dev, base, K_MEM_CACHE_NONE);
 
 	k_mutex_init(&data->mutex);
+	k_work_init(&DEV_DATA(dev)->setup_work, udc_dwc3_setup_worker);
 
 	data->caps.rwup = false;
 	data->caps.addr_before_status = true;
