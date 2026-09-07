@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <stdbool.h>
 
+#include <zephyr/cache.h>
 #include <zephyr/drivers/usb/udc.h>
 #include <zephyr/kernel.h>
 #include <zephyr/shell/shell.h>
@@ -948,6 +949,9 @@ static int udc_dwc3_pop_trb(const struct device *const dev, struct udc_dwc3_ep_d
 	if (USB_EP_DIR_IS_OUT(ep_data->cfg.addr)) {
 		(*buf)->len =
 			(*buf)->size - FIELD_GET(UDC_DWC3_TRB_STATUS_BUFSIZ_MASK, trb->status);
+		if (IS_ENABLED(CONFIG_DCACHE)) {
+			sys_cache_data_invd_range((*buf)->data, (*buf)->len);
+		}
 	}
 
 	return 0;
@@ -1419,6 +1423,11 @@ static void udc_dwc3_on_ctrl_out(const struct device *const dev)
 			return;
 		}
 
+		/* The controller wrote the packet past the CPU's cache. */
+		if (IS_ENABLED(CONFIG_DCACHE)) {
+			sys_cache_data_invd_range(buf->data, sizeof(*setup_packet));
+		}
+
 		buf->len = 0;
 
 		/* Latency optimization: set the address immediately to be able to be able
@@ -1442,6 +1451,9 @@ static void udc_dwc3_on_ctrl_out(const struct device *const dev)
 
 		/* Update the size to what the hardware reports */
 		buf->len = buf->size - FIELD_GET(UDC_DWC3_TRB_STATUS_BUFSIZ_MASK, trb_status);
+		if (IS_ENABLED(CONFIG_DCACHE)) {
+			sys_cache_data_invd_range(buf->data, buf->len);
+		}
 
 		if (trb_trbctl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA) {
 			LOG_HEXDUMP_DBG(buf->data, buf->len, "CTRL DATA received");
@@ -1821,6 +1833,15 @@ static int udc_dwc3_ep_enqueue(const struct device *const dev,
 
 	LOG_DBG("Enqueueing buf %p, data %p, size %u, len %u, ep 0x%02x %u:%u:%u",
 		buf, buf->data, buf->size, buf->len, ep_cfg->addr, bi.setup, bi.data, bi.status);
+
+	/* Hand the buffer to the controller: data written out, no line left to evict over it. */
+	if (IS_ENABLED(CONFIG_DCACHE)) {
+		if (USB_EP_DIR_IS_IN(ep_cfg->addr)) {
+			sys_cache_data_flush_range(buf->data, buf->len);
+		} else {
+			sys_cache_data_invd_range(buf->data, buf->size);
+		}
+	}
 
 	udc_buf_put(ep_cfg, buf);
 
