@@ -513,6 +513,8 @@ struct udc_dwc3_ep_data {
 	struct k_work work;
 	/* Point back to the device for work queues */
 	const struct device *dev;
+	/* Protect normal endpoint TRB ring metadata and slot ownership */
+	struct k_spinlock trb_lock;
 	/* Buffer of pointers to net_buf, with index matching the position in the TRB buffers */
 	struct net_buf *net_buf[CONFIG_UDC_DWC3_TRB_NUM];
 	/* Buffer of TRB structures, with index matching the position in the net_buf buffers */
@@ -640,11 +642,12 @@ void udc_dwc3_ring_inc(uint32_t *const nump, const uint32_t size)
 	*nump = (num >= size) ? 0 : num;
 }
 
-static void udc_dwc3_push_trb(const struct device *const dev,
-			      struct udc_dwc3_ep_data *const ep_data,
-			      struct net_buf *const buf, const uint32_t ctrl)
+/* Caller must hold ep_data->trb_lock. */
+static uint32_t udc_dwc3_push_trb_locked(struct udc_dwc3_ep_data *const ep_data,
+					 struct net_buf *const buf, const uint32_t ctrl)
 {
-	volatile struct udc_dwc3_trb *const trb = &ep_data->trb_buf[ep_data->head];
+	const uint32_t index = ep_data->head;
+	volatile struct udc_dwc3_trb *const trb = &ep_data->trb_buf[index];
 
 	/* If the next TRB in the chain is still owned by the hardware, need
 	 * to retry later when more resources become available.
@@ -652,7 +655,7 @@ static void udc_dwc3_push_trb(const struct device *const dev,
 	__ASSERT_NO_MSG(!ep_data->full);
 
 	/* Associate an active buffer and a TRB together */
-	ep_data->net_buf[ep_data->head] = buf;
+	ep_data->net_buf[index] = buf;
 
 	/* TRB# with one more chunk of data */
 	trb->addr_lo = LO32((uintptr_t)buf->data);
@@ -660,34 +663,37 @@ static void udc_dwc3_push_trb(const struct device *const dev,
 	trb->status = USB_EP_DIR_IS_IN(ep_data->cfg.addr) ? buf->len : buf->size;
 	trb->ctrl = ctrl;
 
-	LOG_DBG("PUSH %u buf %p, data %p, size %u",
-		ep_data->head, (void *)buf, (void *)buf->data, buf->size);
-
 	/* Shift the head */
 	udc_dwc3_ring_inc(&ep_data->head, CONFIG_UDC_DWC3_TRB_NUM - 1);
 
 	/* If the head touches the tail after we add something, we are full */
 	ep_data->full = (ep_data->head == ep_data->tail);
+
+	return index;
 }
 
-static struct net_buf *udc_dwc3_pop_trb(const struct device *const dev,
-					struct udc_dwc3_ep_data *const ep_data)
+/* Caller must hold ep_data->trb_lock. */
+static struct net_buf *udc_dwc3_pop_trb_locked(struct udc_dwc3_ep_data *const ep_data,
+					       uint32_t *const trb_status,
+					       uint32_t *const trb_index)
 {
-	struct net_buf *const buf = ep_data->net_buf[ep_data->tail];
-
-	/* Clear the last TRB */
-	ep_data->net_buf[ep_data->tail] = NULL;
-
-	/* Move to the next position in the ring buffer */
-	udc_dwc3_ring_inc(&ep_data->tail, CONFIG_UDC_DWC3_TRB_NUM - 1);
+	const uint32_t index = ep_data->tail;
+	volatile const struct udc_dwc3_trb *const trb = &ep_data->trb_buf[index];
+	struct net_buf *const buf = ep_data->net_buf[index];
 
 	if (buf == NULL) {
-		LOG_ERR("pop: the next TRB is emtpy");
 		return NULL;
 	}
 
-	LOG_DBG("POP %u EP 0x%02x, buf %p, data %p",
-		ep_data->tail, ep_data->cfg.addr, (void *)buf, (void *)buf->data);
+	/* Snapshot hardware-owned completion data before making this slot reusable. */
+	*trb_status = trb->status;
+	*trb_index = index;
+
+	/* Clear the last TRB */
+	ep_data->net_buf[index] = NULL;
+
+	/* Move to the next position in the ring buffer */
+	udc_dwc3_ring_inc(&ep_data->tail, CONFIG_UDC_DWC3_TRB_NUM - 1);
 
 	/* If we just pulled a TRB, we know we made one hole and we are not full anymore */
 	ep_data->full = false;
@@ -865,6 +871,8 @@ static void udc_dwc3_depcmd_end_xfer(const struct device *const dev,
 				     struct udc_dwc3_ep_data *const ep_data,
 				     uint32_t flags)
 {
+	k_spinlock_key_t key;
+
 	flags |= FIELD_PREP(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, ep_data->xferrscidx);
 	flags |= UDC_DWC3_DEPCMD_DEPENDXFER;
 
@@ -872,7 +880,11 @@ static void udc_dwc3_depcmd_end_xfer(const struct device *const dev,
 
 	LOG_DBG("DepEndXfer done ep=0x%02x", ep_data->cfg.addr);
 
+	key = k_spin_lock(&ep_data->trb_lock);
 	ep_data->head = ep_data->tail = 0;
+	ep_data->total = 0;
+	ep_data->full = false;
+	k_spin_unlock(&ep_data->trb_lock, key);
 }
 
 static void udc_dwc3_depcmd_start_config(const struct device *const dev,
@@ -966,34 +978,62 @@ static int udc_dwc3_trb_bulk(const struct device *const dev,
 			     struct net_buf *const buf)
 {
 	uint32_t ctrl = UDC_DWC3_TRB_CTRL_IOC | UDC_DWC3_TRB_CTRL_HWO | UDC_DWC3_TRB_CTRL_CSP;
+	k_spinlock_key_t key;
+	uint8_t *buf_data;
+	uint32_t transfer_total;
+	uint32_t trb_index;
+	uint16_t buf_size;
+	uint16_t buf_len;
+	bool has_zlp;
+	bool chained = false;
 
-	LOG_INF("TRB_BULK_EP_0x%02x, buf %p, data %p, size %u, len %u",
-		ep_data->cfg.addr, (void *)buf, (void *)buf->data, buf->size, buf->len);
-
+	key = k_spin_lock(&ep_data->trb_lock);
 	if (ep_data->full) {
+		k_spin_unlock(&ep_data->trb_lock, key);
 		return -EBUSY;
 	}
 
-	if (udc_ep_buf_has_zlp(buf)) {
-		LOG_DBG("Buffer has a ZLP flag, terminating the transfer");
+	has_zlp = udc_ep_buf_has_zlp(buf);
+	buf_data = buf->data;
+	buf_size = buf->size;
+	buf_len = buf->len;
+
+	if (has_zlp) {
 		ctrl |= UDC_DWC3_TRB_CTRL_TRBCTL_NORMAL_ZLP;
 		ep_data->total = 0;
+		transfer_total = 0;
 	} else {
 		ctrl |= UDC_DWC3_TRB_CTRL_TRBCTL_NORMAL;
 		ep_data->total += buf->len;
+		transfer_total = ep_data->total;
 
 		if (USB_EP_DIR_IS_IN(ep_data->cfg.addr) &&
 		    ep_data->total % ep_data->cfg.mps == 0) {
-			LOG_DBG("Buffer is a multiple of %d, continuing this transfer of %u bytes",
-				ep_data->cfg.mps, ep_data->total);
 			ctrl |= UDC_DWC3_TRB_CTRL_CHN;
+			chained = true;
 		} else {
-			LOG_DBG("End of USB transfer, %u bytes transferred", ep_data->total);
 			ep_data->total = 0;
 		}
 	}
 
-	udc_dwc3_push_trb(dev, ep_data, buf, ctrl);
+	trb_index = udc_dwc3_push_trb_locked(ep_data, buf, ctrl);
+	k_spin_unlock(&ep_data->trb_lock, key);
+
+	LOG_INF("Processing buffer %p from queue", (void *)buf);
+	LOG_INF("TRB_BULK_EP_0x%02x, buf %p, data %p, size %u, len %u",
+		ep_data->cfg.addr, (void *)buf, (void *)buf_data, buf_size, buf_len);
+
+	if (has_zlp) {
+		LOG_DBG("Buffer has a ZLP flag, terminating the transfer");
+	} else if (chained) {
+		LOG_DBG("Buffer is a multiple of %d, continuing this transfer of %u bytes",
+			ep_data->cfg.mps, transfer_total);
+	} else {
+		LOG_DBG("End of USB transfer, %u bytes transferred", transfer_total);
+	}
+
+	LOG_DBG("PUSH %u buf %p, data %p, size %u",
+		trb_index, (void *)buf, (void *)buf_data, buf_size);
 	udc_dwc3_depcmd_update_xfer(dev, ep_data);
 
 	return 0;
@@ -1503,12 +1543,9 @@ static void udc_dwc3_on_xfer_not_ready(const struct device *const dev,
 	}
 }
 
-static void udc_dwc3_on_xfer_done(const struct device *const dev,
-				  struct udc_dwc3_ep_data *const ep_data)
+static void udc_dwc3_on_xfer_done(const uint32_t trb_status)
 {
-	volatile struct udc_dwc3_trb *const trb = &ep_data->trb_buf[ep_data->tail];
-
-	switch (trb->status & UDC_DWC3_TRB_STATUS_TRBSTS_MASK) {
+	switch (trb_status & UDC_DWC3_TRB_STATUS_TRBSTS_MASK) {
 	case UDC_DWC3_TRB_STATUS_TRBSTS_OK:
 		break;
 	case UDC_DWC3_TRB_STATUS_TRBSTS_MISSEDISOC:
@@ -1535,23 +1572,30 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 	const int epn = FIELD_GET(UDC_DWC3_DEPEVT_EPN_MASK, evt);
 	struct udc_dwc3_ep_data *const ep_data =
 		(epn & 1) ? &cfg->ep_data_in[epn >> 1] : &cfg->ep_data_out[epn >> 1];
-	volatile struct udc_dwc3_trb *const trb = &ep_data->trb_buf[ep_data->tail];
+	k_spinlock_key_t key;
 	struct net_buf *buf;
+	uint32_t trb_status;
+	uint32_t trb_index;
 	int ret;
 
-	/* Clear the TRB that triggered the event */
-	buf = udc_dwc3_pop_trb(dev, ep_data);
+	/* Snapshot completion data and release its TRB slot as one atomic operation. */
+	key = k_spin_lock(&ep_data->trb_lock);
+	buf = udc_dwc3_pop_trb_locked(ep_data, &trb_status, &trb_index);
+	k_spin_unlock(&ep_data->trb_lock, key);
 	if (buf == NULL) {
+		LOG_ERR("pop: the next TRB is empty");
 		udc_submit_event(dev, UDC_EVT_ERROR, -ENOBUFS);
 		return;
 	}
 
+	LOG_DBG("POP %u EP 0x%02x, buf %p, data %p",
+		trb_index, ep_data->cfg.addr, (void *)buf, (void *)buf->data);
 	LOG_DBG("XFER_DONE_NORM: EP 0x%02x, data %p", ep_data->cfg.addr, (void *)buf->data);
-	udc_dwc3_on_xfer_done(dev, ep_data);
+	udc_dwc3_on_xfer_done(trb_status);
 
 	/* For buffers coming from the host, update the size actually received */
 	if (USB_EP_DIR_IS_OUT(ep_data->cfg.addr)) {
-		buf->len = buf->size - FIELD_GET(UDC_DWC3_TRB_STATUS_BUFSIZ_MASK, trb->status);
+		buf->len = buf->size - FIELD_GET(UDC_DWC3_TRB_STATUS_BUFSIZ_MASK, trb_status);
 		if (IS_ENABLED(CONFIG_DCACHE)) {
 			sys_cache_data_invd_range(buf->data, buf->len);
 		}
@@ -1951,8 +1995,6 @@ static void udc_dwc3_ep_worker(struct k_work *const work)
 	}
 
 	while ((buf = udc_buf_peek(&ep_data->cfg)) != NULL) {
-		LOG_INF("Processing buffer %p from queue", (void *)buf);
-
 		ret = udc_dwc3_trb_bulk(dev, ep_data, buf);
 		if (ret != 0) {
 			LOG_DBG("abort: No more room for buffer");
