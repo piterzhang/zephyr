@@ -974,11 +974,11 @@ static void udc_dwc3_trb_ctrl_in(const struct device *const dev,
 }
 
 static int udc_dwc3_trb_bulk(const struct device *const dev,
-			     struct udc_dwc3_ep_data *const ep_data,
-			     struct net_buf *const buf)
+			     struct udc_dwc3_ep_data *const ep_data)
 {
 	uint32_t ctrl = UDC_DWC3_TRB_CTRL_IOC | UDC_DWC3_TRB_CTRL_HWO | UDC_DWC3_TRB_CTRL_CSP;
 	k_spinlock_key_t key;
+	struct net_buf *buf;
 	uint8_t *buf_data;
 	uint32_t transfer_total;
 	uint32_t trb_index;
@@ -991,6 +991,16 @@ static int udc_dwc3_trb_bulk(const struct device *const dev,
 	if (ep_data->full) {
 		k_spin_unlock(&ep_data->trb_lock, key);
 		return -EBUSY;
+	}
+
+	/*
+	 * Transfer ownership before setting HWO. A completed net_buf is linked into
+	 * the USB event list, so it must no longer be linked into the endpoint FIFO.
+	 */
+	buf = udc_buf_get(&ep_data->cfg);
+	if (buf == NULL) {
+		k_spin_unlock(&ep_data->trb_lock, key);
+		return -ENODATA;
 	}
 
 	has_zlp = udc_ep_buf_has_zlp(buf);
@@ -1984,7 +1994,6 @@ static void udc_dwc3_ep_worker(struct k_work *const work)
 {
 	struct udc_dwc3_ep_data *const ep_data = CONTAINER_OF(work, struct udc_dwc3_ep_data, work);
 	const struct device *const dev = ep_data->dev;
-	struct net_buf *buf;
 	int ret;
 
 	LOG_DBG("checking for pending transfers for EP 0x%02x", ep_data->cfg.addr);
@@ -1994,16 +2003,23 @@ static void udc_dwc3_ep_worker(struct k_work *const work)
 		return;
 	}
 
-	while ((buf = udc_buf_peek(&ep_data->cfg)) != NULL) {
-		ret = udc_dwc3_trb_bulk(dev, ep_data, buf);
-		if (ret != 0) {
+	while (true) {
+		ret = udc_dwc3_trb_bulk(dev, ep_data);
+		if (ret == -ENODATA) {
+			break;
+		}
+
+		if (ret == -EBUSY) {
 			LOG_DBG("abort: No more room for buffer");
 			break;
 		}
 
-		LOG_DBG("success: Buffer enqueued");
+		if (ret != 0) {
+			LOG_ERR("Failed to enqueue buffer: %d", ret);
+			break;
+		}
 
-		udc_buf_get(&ep_data->cfg);
+		LOG_DBG("success: Buffer enqueued");
 	}
 }
 
