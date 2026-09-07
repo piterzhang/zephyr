@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <stdbool.h>
 
+#include <zephyr/cache.h>
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/usb/udc.h>
 #include <zephyr/sys/device_mmio.h>
@@ -1427,8 +1428,14 @@ static void udc_dwc3_on_ctrl_out(const struct device *const dev)
 			return;
 		}
 
-		setup = (struct usb_setup_packet *)buf->data;
+		/* Update and synchronize the buffer before inspecting the SETUP packet. */
+		buf->len = buf->size -
+			   FIELD_GET(UDC_DWC3_TRB_STATUS_BUFSIZ_MASK, trb_status);
+		if (IS_ENABLED(CONFIG_DCACHE)) {
+			sys_cache_data_invd_range(buf->data, buf->len);
+		}
 
+		setup = (struct usb_setup_packet *)buf->data;
 		/* Latency optimization: set the address immediately to be able to be able
 		 * to ACK/NAK the first packets from the host with the new address,
 		 * otherwise the host issue a reset.
@@ -1437,9 +1444,6 @@ static void udc_dwc3_on_ctrl_out(const struct device *const dev)
 		    setup->bRequest == USB_SREQ_SET_ADDRESS) {
 			udc_dwc3_set_address(dev, setup->wValue);
 		}
-
-		/* Update the size to what the hardware reports */
-		buf->len = buf->size - FIELD_GET(UDC_DWC3_TRB_STATUS_BUFSIZ_MASK, trb_status);
 
 		LOG_HEXDUMP_DBG(buf->data, buf->len, "SETUP received");
 
@@ -1461,6 +1465,9 @@ static void udc_dwc3_on_ctrl_out(const struct device *const dev)
 
 		/* Update the size to what the hardware reports */
 		buf->len = buf->size - FIELD_GET(UDC_DWC3_TRB_STATUS_BUFSIZ_MASK, trb_status);
+		if (IS_ENABLED(CONFIG_DCACHE)) {
+			sys_cache_data_invd_range(buf->data, buf->len);
+		}
 
 		if (trb_trbctl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA) {
 			LOG_HEXDUMP_DBG(buf->data, buf->len, "CTRL DATA received");
@@ -1545,6 +1552,9 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 	/* For buffers coming from the host, update the size actually received */
 	if (USB_EP_DIR_IS_OUT(ep_data->cfg.addr)) {
 		buf->len = buf->size - FIELD_GET(UDC_DWC3_TRB_STATUS_BUFSIZ_MASK, trb->status);
+		if (IS_ENABLED(CONFIG_DCACHE)) {
+			sys_cache_data_invd_range(buf->data, buf->len);
+		}
 	}
 
 	ret = udc_submit_ep_event(dev, buf, 0);
@@ -1659,6 +1669,14 @@ static int udc_dwc3_ep_enqueue(const struct device *const dev,
 {
 	struct udc_dwc3_ep_data *const ep_data = CONTAINER_OF(ep_cfg, struct udc_dwc3_ep_data, cfg);
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+
+	if (IS_ENABLED(CONFIG_DCACHE)) {
+		if (USB_EP_DIR_IS_IN(ep_cfg->addr)) {
+			sys_cache_data_flush_range(buf->data, buf->len);
+		} else {
+			sys_cache_data_invd_range(buf->data, buf->size);
+		}
+	}
 
 	udc_buf_put(ep_cfg, buf);
 
