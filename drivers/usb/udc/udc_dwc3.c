@@ -528,6 +528,13 @@ struct udc_dwc3_ep_data {
 	bool full;
 	/* Given by the hardware for use in endpoint commands */
 	uint32_t xferrscidx;
+	/*
+	 * Set while the controller owns a transfer resource for this endpoint.
+	 * udc_ep_is_busy() cannot serve this purpose: it is cleared when a
+	 * transfer completes, while the resource stays allocated until an End
+	 * Transfer command releases it.
+	 */
+	bool xfer_started;
 };
 
 /*
@@ -848,6 +855,7 @@ static void udc_dwc3_depcmd_start_xfer(const struct device *const dev,
 
 	ep_data->xferrscidx =
 		udc_dwc3_depcmd(dev, ep_data, UDC_DWC3_DEPCMD_DEPSTRTXFER);
+	ep_data->xfer_started = true;
 
 	LOG_DBG("DepStartXfer done ep=0x%02x xferrscidx=0x%x",
 		ep_data->cfg.addr, ep_data->xferrscidx);
@@ -879,6 +887,9 @@ static void udc_dwc3_depcmd_end_xfer(const struct device *const dev,
 	udc_dwc3_depcmd(dev, ep_data, flags);
 
 	LOG_DBG("DepEndXfer done ep=0x%02x", ep_data->cfg.addr);
+
+	ep_data->xfer_started = false;
+	ep_data->xferrscidx = 0U;
 
 	key = k_spin_lock(&ep_data->trb_lock);
 	ep_data->head = ep_data->tail = 0;
@@ -1252,6 +1263,92 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 	udc_dwc3_depcmd_start_config(dev, &cfg->ep_data_out[0]);
 }
 
+/*
+ * Re-arm EP0 OUT for a SETUP packet after a bus reset.
+ *
+ * A bus reset cancels the control transfer in progress, but EP0 keeps the stage
+ * its TRB was armed for. When the reset interrupts a control read, EP0 OUT is
+ * left armed as CONTROL_DATA and the controller then refuses the SETUP packet
+ * the host sends after the reset: the packet sits in the RX FIFO, no endpoint
+ * event is raised, and the host keeps resetting the port until it gives up.
+ *
+ * The USB stack does not enqueue a new SETUP buffer on reset, so the driver
+ * restores the SETUP stage itself.
+ */
+static void udc_dwc3_ep0_rearm_setup(const struct device *const dev)
+{
+	const struct udc_dwc3_config *const cfg = dev->config;
+	struct udc_dwc3_data *const priv = DEV_DATA(dev);
+	struct udc_buf_info *bi;
+	k_spinlock_key_t key;
+	struct net_buf *buf;
+
+	key = k_spin_lock(&priv->ctrl_lock);
+
+	/*
+	 * A transfer that was started before the reset still owns a transfer
+	 * resource, and a Start Transfer command on an endpoint that already
+	 * owns one is rejected with CMDERR. End it first to release it.
+	 */
+	for (int i = 0; i < 2; i++) {
+		struct udc_dwc3_ep_data *const ep_data =
+			(i == 0) ? &cfg->ep_data_out[0] : &cfg->ep_data_in[0];
+
+		if (ep_data->xfer_started) {
+			udc_dwc3_depcmd_end_xfer(dev, ep_data, UDC_DWC3_DEPCMD_HIPRI_FORCERM);
+			/*
+			 * Clearing CMDACT does not mean the transfer resource has
+			 * been reclaimed on every controller revision.
+			 */
+			k_busy_wait(100);
+		}
+		udc_ep_set_busy(&ep_data->cfg, false);
+
+		ep_data->trb_buf[0].ctrl = 0U;
+		ep_data->trb_buf[0].status = 0U;
+	}
+
+	/*
+	 * Discard any stage of the interrupted transfer still queued ahead of
+	 * the SETUP buffer. The stack enqueues that buffer while the previous
+	 * transfer is in flight, so it is normally already waiting behind them.
+	 */
+	buf = NULL;
+	while (true) {
+		struct net_buf *head = udc_buf_peek(&cfg->ep_data_out[0].cfg);
+
+		if (head == NULL) {
+			break;
+		}
+
+		if (udc_get_buf_info(head)->setup) {
+			buf = head;
+			break;
+		}
+
+		net_buf_unref(udc_buf_get(&cfg->ep_data_out[0].cfg));
+	}
+
+	if (buf == NULL) {
+		/* The stack enqueues a SETUP buffer when it handles the reset. */
+		k_spin_unlock(&priv->ctrl_lock, key);
+		return;
+	}
+
+	net_buf_reset(buf);
+	bi = udc_get_buf_info(buf);
+	bi->data = 0;
+	bi->status = 0;
+
+	/* on_ctrl_out() derives the received length from buf->size. */
+	buf->size = MIN(net_buf_max_len(buf), sizeof(struct usb_setup_packet));
+
+	udc_ep_set_busy(&cfg->ep_data_out[0].cfg, true);
+	udc_dwc3_trb_ctrl_out(dev, buf, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_SETUP);
+
+	k_spin_unlock(&priv->ctrl_lock, key);
+}
+
 static void udc_dwc3_on_usb_reset(const struct device *const dev)
 {
 	const struct udc_dwc3_config *const cfg = dev->config;
@@ -1278,6 +1375,8 @@ static void udc_dwc3_on_usb_reset(const struct device *const dev)
 
 	/* Perform the USB reset operations manually to improve latency */
 	udc_dwc3_set_address(dev, 0);
+
+	udc_dwc3_ep0_rearm_setup(dev);
 }
 
 static void udc_dwc3_on_connect_done(const struct device *const dev)
@@ -1435,6 +1534,8 @@ static void udc_dwc3_on_ctrl_in(const struct device *const dev)
 
 	/* Used when receiving a completed buffer from the hardware: mark as free */
 	udc_ep_set_busy(&ep_data->cfg, false);
+	/* XferComplete means the controller retired the transfer resource. */
+	ep_data->xfer_started = false;
 
 	udc_dwc3_next_ctrl(dev, &cfg->ep_data_out[0]);
 	udc_dwc3_next_ctrl(dev, ep_data);
@@ -1503,6 +1604,8 @@ static void udc_dwc3_on_ctrl_out(const struct device *const dev)
 		 * not re-arm EP0 OUT until the worker has consumed it.
 		 */
 		udc_ep_set_busy(&ep_data->cfg, false);
+		/* XferComplete means the controller retired the transfer resource. */
+		ep_data->xfer_started = false;
 		(void)k_work_submit_to_queue(udc_get_work_q(), &DEV_DATA(dev)->setup_work);
 		return;
 	} else {
@@ -1533,6 +1636,8 @@ static void udc_dwc3_on_ctrl_out(const struct device *const dev)
 
 	/* Used when receiving a completed buffer from the hardware: mark as free */
 	udc_ep_set_busy(&ep_data->cfg, false);
+	/* XferComplete means the controller retired the transfer resource. */
+	ep_data->xfer_started = false;
 
 	udc_dwc3_next_ctrl(dev, ep_data);
 }
