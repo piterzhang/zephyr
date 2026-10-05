@@ -1859,8 +1859,31 @@ static int udc_dwc3_ep_dequeue(const struct device *const dev,
 			       struct udc_ep_config *const ep_cfg)
 {
 	struct udc_dwc3_ep_data *const ep_data = CONTAINER_OF(ep_cfg, struct udc_dwc3_ep_data, cfg);
+	struct net_buf *armed[CONFIG_UDC_DWC3_TRB_NUM - 1];
+	size_t count = 0;
+	k_spinlock_key_t key;
+	uint32_t slot;
+
+	key = k_spin_lock(&ep_data->trb_lock);
+	slot = ep_data->tail;
+	k_spin_unlock(&ep_data->trb_lock, key);
 
 	udc_dwc3_depcmd_end_xfer(dev, ep_data, UDC_DWC3_DEPCMD_HIPRI_FORCERM);
+
+	/* Ending the transfer resets the ring; return its buffers, oldest first. */
+	key = k_spin_lock(&ep_data->trb_lock);
+	for (size_t i = 0; i < ARRAY_SIZE(armed); i++) {
+		if (ep_data->net_buf[slot] != NULL) {
+			armed[count++] = ep_data->net_buf[slot];
+			ep_data->net_buf[slot] = NULL;
+		}
+		udc_dwc3_ring_inc(&slot, CONFIG_UDC_DWC3_TRB_NUM - 1);
+	}
+	k_spin_unlock(&ep_data->trb_lock, key);
+
+	for (size_t i = 0; i < count; i++) {
+		udc_submit_ep_event(dev, armed[i], -ECONNABORTED);
+	}
 
 	udc_ep_cancel_queued(dev, ep_cfg);
 	udc_ep_set_busy(ep_cfg, false);
