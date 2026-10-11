@@ -535,6 +535,11 @@ struct udc_dwc3_ep_data {
 	 * Transfer command releases it.
 	 */
 	bool xfer_started;
+	/*
+	 * Set once the endpoint has its transfer resource. It keeps the resource
+	 * while disabled, until a Start New Configuration command.
+	 */
+	bool xfer_rsc_assigned;
 };
 
 /*
@@ -898,18 +903,25 @@ static void udc_dwc3_depcmd_end_xfer(const struct device *const dev,
 	k_spin_unlock(&ep_data->trb_lock, key);
 }
 
-static void udc_dwc3_depcmd_start_config(const struct device *const dev,
-					 struct udc_dwc3_ep_data *const ep_data)
+/*
+ * Start a new configuration: the controller hands out its transfer resources
+ * from the first one again, so every endpoint has to ask for its own anew.
+ * The command goes to physical endpoint 0 with resource index 0.
+ */
+static void udc_dwc3_depcmd_start_config(const struct device *const dev)
 {
-	const bool is_control = USB_EP_GET_IDX(ep_data->cfg.addr) > 0;
-	uint32_t flags = 0;
+	const struct udc_dwc3_config *const cfg = dev->config;
 
-	flags |= FIELD_PREP(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, is_control ? 0 : 2);
-	flags |= UDC_DWC3_DEPCMD_DEPSTARTCFG;
+	udc_dwc3_depcmd(dev, &cfg->ep_data_out[0], UDC_DWC3_DEPCMD_DEPSTARTCFG);
 
-	udc_dwc3_depcmd(dev, ep_data, flags);
+	for (int i = 0; i < cfg->num_in_eps; i++) {
+		cfg->ep_data_in[i].xfer_rsc_assigned = false;
+	}
+	for (int i = 0; i < cfg->num_out_eps; i++) {
+		cfg->ep_data_out[i].xfer_rsc_assigned = false;
+	}
 
-	LOG_DBG("DepStartConfig done ep=0x%02x", ep_data->cfg.addr);
+	LOG_DBG("DepStartConfig done");
 }
 
 /*
@@ -1258,9 +1270,8 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 	reg |= UDC_DWC3_DEVTEN_DISCONNEVTEN;
 	sys_write32(reg, base + UDC_DWC3_DEVTEN);
 
-	/* Configure endpoint 0x00 and 0x80 only for now */
-	udc_dwc3_depcmd_start_config(dev, &cfg->ep_data_in[0]);
-	udc_dwc3_depcmd_start_config(dev, &cfg->ep_data_out[0]);
+	/* The endpoints take their transfer resources as they are first enabled */
+	udc_dwc3_depcmd_start_config(dev);
 }
 
 /*
@@ -1855,10 +1866,10 @@ static int udc_dwc3_ep_enqueue(const struct device *const dev,
 	return 0;
 }
 
-static int udc_dwc3_ep_dequeue(const struct device *const dev,
-			       struct udc_ep_config *const ep_cfg)
+/* End the endpoint's transfer and return the buffers armed in its ring as aborted. */
+static void udc_dwc3_ep_abort_xfer(const struct device *const dev,
+				   struct udc_dwc3_ep_data *const ep_data)
 {
-	struct udc_dwc3_ep_data *const ep_data = CONTAINER_OF(ep_cfg, struct udc_dwc3_ep_data, cfg);
 	struct net_buf *armed[CONFIG_UDC_DWC3_TRB_NUM - 1];
 	size_t count = 0;
 	k_spinlock_key_t key;
@@ -1884,6 +1895,17 @@ static int udc_dwc3_ep_dequeue(const struct device *const dev,
 	for (size_t i = 0; i < count; i++) {
 		udc_submit_ep_event(dev, armed[i], -ECONNABORTED);
 	}
+}
+
+static int udc_dwc3_ep_dequeue(const struct device *const dev,
+			       struct udc_ep_config *const ep_cfg)
+{
+	struct udc_dwc3_ep_data *const ep_data = CONTAINER_OF(ep_cfg, struct udc_dwc3_ep_data, cfg);
+
+	/* A disabled endpoint has none: udc_dwc3_ep_disable() ended it. */
+	if (ep_data->xfer_started) {
+		udc_dwc3_ep_abort_xfer(dev, ep_data);
+	}
 
 	udc_ep_cancel_queued(dev, ep_cfg);
 	udc_ep_set_busy(ep_cfg, false);
@@ -1896,6 +1918,16 @@ static int udc_dwc3_ep_disable(const struct device *const dev,
 {
 	struct udc_dwc3_ep_data *const ep_data = CONTAINER_OF(ep_cfg, struct udc_dwc3_ep_data, cfg);
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+
+	/*
+	 * The transfer started when the endpoint was enabled ends here. The
+	 * stack dequeues only an endpoint with buffers in its queue, so an idle
+	 * one would keep its transfer, and the controller refuses to start
+	 * another over it at the next enable.
+	 */
+	if (USB_EP_GET_IDX(ep_cfg->addr) > 0 && ep_data->xfer_started) {
+		udc_dwc3_ep_abort_xfer(dev, ep_data);
+	}
 
 	sys_clear_bit(base + UDC_DWC3_DALEPENA, ep_data->epn);
 
@@ -2032,7 +2064,16 @@ static int udc_dwc3_ep_enable(const struct device *const dev,
 
 	memset(ep_data->trb_buf, 0, sizeof(*ep_data->trb_buf) * CONFIG_UDC_DWC3_TRB_NUM);
 	udc_dwc3_depcmd_ep_config(dev, ep_data);
-	udc_dwc3_depcmd_ep_xfer_config(dev, ep_data);
+
+	/*
+	 * The controller has a fixed number of transfer resources and takes
+	 * none back when an endpoint is disabled, so an endpoint asks for its
+	 * own once, not each time the host configures the device.
+	 */
+	if (!ep_data->xfer_rsc_assigned) {
+		udc_dwc3_depcmd_ep_xfer_config(dev, ep_data);
+		ep_data->xfer_rsc_assigned = true;
+	}
 
 	if (USB_EP_GET_IDX(ep_data->cfg.addr) > 0) {
 		udc_dwc3_trb_norm_init(dev, ep_data);
