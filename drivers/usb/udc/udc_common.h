@@ -94,6 +94,23 @@ struct net_buf *udc_buf_get(struct udc_ep_config *const ep_cfg);
 struct net_buf *udc_buf_peek(struct udc_ep_config *const ep_cfg);
 
 /**
+ * @brief Peek request queued after another in endpoint FIFO.
+ *
+ * Return the request that follows buf in the endpoint FIFO, without removing
+ * either. Use it to arm a request behind those already given to the
+ * controller, when the driver keeps several requests of an endpoint in
+ * flight and leaves each in the FIFO until its transfer is finished. The
+ * caller must keep buf from being removed from the FIFO meanwhile.
+ *
+ * @param[in] ep_cfg Pointer to endpoint configuration
+ * @param[in] buf    Pointer to a request in the endpoint FIFO
+ *
+ * @return pointer to the next request or NULL if buf is the last one.
+ */
+struct net_buf *udc_buf_peek_next(struct udc_ep_config *const ep_cfg,
+				  struct net_buf *const buf);
+
+/**
  * @brief Put request at the tail of endpoint FIFO.
  *
  * @param[in] ep_cfg Pointer to endpoint configuration

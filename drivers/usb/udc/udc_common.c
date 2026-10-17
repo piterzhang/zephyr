@@ -86,6 +86,21 @@ struct net_buf *udc_buf_peek(struct udc_ep_config *const ep_cfg)
 	return k_fifo_peek_head(&ep_cfg->fifo);
 }
 
+struct net_buf *udc_buf_peek_next(struct udc_ep_config *const ep_cfg,
+				  struct net_buf *const buf)
+{
+	sys_sfnode_t *next;
+
+	if (buf == k_fifo_peek_tail(&ep_cfg->fifo)) {
+		return NULL;
+	}
+
+	/* The FIFO links its items through their first word, the node of a net_buf. */
+	next = sys_sflist_peek_next_no_check((sys_sfnode_t *)&buf->node);
+
+	return next == NULL ? NULL : CONTAINER_OF((sys_snode_t *)next, struct net_buf, node);
+}
+
 void udc_buf_put(struct udc_ep_config *const ep_cfg,
 		 struct net_buf *const buf)
 {
