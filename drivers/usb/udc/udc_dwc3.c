@@ -542,10 +542,14 @@ struct udc_dwc3_ep_data {
 	int epn;
 	/* A work queue entry to process the buffers to submit on that endpoint */
 	struct k_work work;
-	/* To re-queue cancelled buffers after an endpoint is disabled */
-	struct k_fifo requeue_fifo;
 	/* Point back to the device for work queues */
 	const struct device *dev;
+	/*
+	 * Guards the ring below and the head of the endpoint FIFO, which the ring's
+	 * buffers stay in until they complete, between the work queue, which arms
+	 * and completes buffers, and the threads that disable or dequeue.
+	 */
+	struct k_spinlock lock;
 	/* Buffer of pointers to net_buf, with index matching the position in the TRB buffers */
 	struct net_buf *net_buf[CONFIG_UDC_DWC3_TRB_NUM];
 	/* Buffer of TRB structures, with index matching the position in the net_buf buffers */
@@ -893,9 +897,9 @@ static void udc_dwc3_depcmd_start_config(const struct device *const dev,
  * Update command).
  */
 
-static void udc_dwc3_push_trb(const struct device *const dev,
-			      struct udc_dwc3_ep_data *const ep_data,
-			      struct net_buf *const buf, const uint32_t ctrl)
+/* Caller must hold ep_data->lock. */
+static void udc_dwc3_push_trb_locked(struct udc_dwc3_ep_data *const ep_data,
+				     struct net_buf *const buf, const uint32_t ctrl)
 {
 	volatile struct udc_dwc3_trb *const trb = &ep_data->trb_buf[ep_data->head];
 
@@ -923,9 +927,17 @@ static void udc_dwc3_push_trb(const struct device *const dev,
 	ep_data->full = (ep_data->head == ep_data->tail);
 }
 
-static int udc_dwc3_pop_trb(const struct device *const dev, struct udc_dwc3_ep_data *const ep_data,
-			    struct net_buf **buf, struct udc_dwc3_trb *trb)
+/*
+ * Caller must hold ep_data->lock. Release the TRB at the ring's tail if the
+ * controller completed it, and take its buffer off the endpoint FIFO: the
+ * ring holds the oldest buffers of the FIFO, so the completed one is at its
+ * head. A completed buffer goes into the event list next, so it must no
+ * longer be linked into the endpoint FIFO.
+ */
+static int udc_dwc3_pop_trb_locked(struct udc_dwc3_ep_data *const ep_data, struct net_buf **buf,
+				   struct udc_dwc3_trb *trb)
 {
+	struct net_buf *queued;
 	*buf = ep_data->net_buf[ep_data->tail];
 	*trb = ep_data->trb_buf[ep_data->tail];
 
@@ -948,6 +960,13 @@ static int udc_dwc3_pop_trb(const struct device *const dev, struct udc_dwc3_ep_d
 	/* If we just pulled a TRB, we know we made one hole and we are not full anymore */
 	ep_data->full = false;
 
+	queued = udc_buf_get(&ep_data->cfg);
+	if (queued != *buf) {
+		LOG_ERR("EP 0x%02x completed buf %p, FIFO head %p", ep_data->cfg.addr,
+			(void *)*buf, (void *)queued);
+		return -EINVAL;
+	}
+
 	/* For buffers coming from the host, update the size actually received */
 	if (USB_EP_DIR_IS_OUT(ep_data->cfg.addr)) {
 		(*buf)->len =
@@ -958,6 +977,41 @@ static int udc_dwc3_pop_trb(const struct device *const dev, struct udc_dwc3_ep_d
 	}
 
 	return 0;
+}
+
+/* Caller must hold ep_data->lock. The number of buffers the ring holds. */
+static uint32_t udc_dwc3_ring_count_locked(const struct udc_dwc3_ep_data *const ep_data)
+{
+	const uint32_t size = CONFIG_UDC_DWC3_TRB_NUM - 1;
+
+	if (ep_data->full) {
+		return size;
+	}
+
+	return (ep_data->head + size - ep_data->tail) % size;
+}
+
+/*
+ * Caller must hold ep_data->lock. The first buffer of the endpoint FIFO the
+ * ring does not hold yet: the ring holds the oldest ones, in FIFO order.
+ */
+static struct net_buf *udc_dwc3_next_unarmed_locked(struct udc_dwc3_ep_data *const ep_data)
+{
+	struct net_buf *buf = udc_buf_peek(&ep_data->cfg);
+
+	for (uint32_t n = udc_dwc3_ring_count_locked(ep_data); n > 0U && buf != NULL; n--) {
+		buf = udc_buf_peek_next(&ep_data->cfg, buf);
+	}
+
+	return buf;
+}
+
+/* Caller must hold ep_data->lock. Forget the buffers the ring held; they stay in the FIFO. */
+static void udc_dwc3_ring_reset_locked(struct udc_dwc3_ep_data *const ep_data)
+{
+	memset(ep_data->net_buf, 0, sizeof(ep_data->net_buf));
+	ep_data->head = ep_data->tail = 0;
+	ep_data->full = false;
 }
 
 static void udc_dwc3_trb_nonctrl_init(const struct device *const dev,
@@ -1023,18 +1077,32 @@ static void udc_dwc3_trb_ctrl_in(const struct device *const dev,
 	udc_dwc3_depcmd_start_xfer(dev, ep_data);
 }
 
+/*
+ * Arm the first buffer of the endpoint FIFO the ring does not hold yet. It
+ * stays in the FIFO until it completes, so that udc_ep_dequeue() sees the
+ * buffers the ring holds as queued. -EBUSY when the ring is full, -ENODATA
+ * when every buffer is armed.
+ */
 static int udc_dwc3_trb_bulk(const struct device *const dev,
-			     struct udc_dwc3_ep_data *const ep_data,
-			     struct net_buf *const buf)
+			     struct udc_dwc3_ep_data *const ep_data)
 {
 	uint32_t ctrl = UDC_DWC3_TRB_CTRL_IOC | UDC_DWC3_TRB_CTRL_HWO | UDC_DWC3_TRB_CTRL_CSP;
+	k_spinlock_key_t key = k_spin_lock(&ep_data->lock);
+	struct net_buf *buf;
+
+	if (ep_data->full) {
+		k_spin_unlock(&ep_data->lock, key);
+		return -EBUSY;
+	}
+
+	buf = udc_dwc3_next_unarmed_locked(ep_data);
+	if (buf == NULL) {
+		k_spin_unlock(&ep_data->lock, key);
+		return -ENODATA;
+	}
 
 	LOG_INF("TRB_BULK_EP_0x%02x, buf %p, data %p, size %u, len %u",
 		ep_data->cfg.addr, (void *)buf, (void *)buf->data, buf->size, buf->len);
-
-	if (ep_data->full) {
-		return -EBUSY;
-	}
 
 	if (udc_ep_buf_has_zlp(buf)) {
 		LOG_INF("Buffer has a ZLP flag");
@@ -1043,7 +1111,9 @@ static int udc_dwc3_trb_bulk(const struct device *const dev,
 		ctrl |= UDC_DWC3_TRB_CTRL_TRBCTL_NORMAL;
 	}
 
-	udc_dwc3_push_trb(dev, ep_data, buf, ctrl);
+	udc_dwc3_push_trb_locked(ep_data, buf, ctrl);
+	k_spin_unlock(&ep_data->lock, key);
+
 	udc_ep_set_busy(&ep_data->cfg, true);
 	udc_dwc3_depcmd_update_xfer(dev, ep_data);
 
@@ -1548,7 +1618,7 @@ static void udc_dwc3_on_xfer_not_ready_out(const struct device *const dev, const
 	udc_dwc3_ctrl_next(dev);
 }
 
-/* Report the status of trb, a completed TRB as udc_dwc3_pop_trb() copied it. */
+/* Report the status of trb, a completed TRB as udc_dwc3_pop_trb_locked() copied it. */
 static void udc_dwc3_on_xfer_done(const struct udc_dwc3_trb *const trb)
 {
 	switch (trb->status & UDC_DWC3_TRB_STATUS_TRBSTS_MASK) {
@@ -1579,12 +1649,15 @@ static void udc_dwc3_on_xfer_error_nonctrl(const struct device *const dev, const
 	const int epn = FIELD_GET(UDC_DWC3_DEPEVT_EPN_MASK, evt);
 	struct udc_dwc3_ep_data *const ep_data = _EP_DATA_FROM_EPN(cfg, epn);
 	struct udc_dwc3_trb trb;
+	k_spinlock_key_t key;
 	struct net_buf *buf;
 	int ret;
 
 	LOG_ERR("Transfer error on endpoint 0x%02x", ep_data->cfg.addr);
 
-	ret = udc_dwc3_pop_trb(dev, ep_data, &buf, &trb);
+	key = k_spin_lock(&ep_data->lock);
+	ret = udc_dwc3_pop_trb_locked(ep_data, &buf, &trb);
+	k_spin_unlock(&ep_data->lock, key);
 	if (ret != 0) {
 		udc_submit_event(dev, UDC_EVT_ERROR, ret);
 		return;
@@ -1619,8 +1692,11 @@ static void udc_dwc3_on_xfer_done_nonctrl(const struct device *const dev, const 
 
 	while (true) {
 		struct udc_dwc3_trb trb;
+		k_spinlock_key_t key;
 
-		ret = udc_dwc3_pop_trb(dev, ep_data, &buf, &trb);
+		key = k_spin_lock(&ep_data->lock);
+		ret = udc_dwc3_pop_trb_locked(ep_data, &buf, &trb);
+		k_spin_unlock(&ep_data->lock, key);
 		if (ret == -ENOBUFS || ret == -EBUSY) {
 			break;
 		}
@@ -1889,8 +1965,37 @@ static int udc_dwc3_ep_enqueue(const struct device *const dev,
 static int udc_dwc3_ep_dequeue(const struct device *const dev,
 			       struct udc_ep_config *const ep_cfg)
 {
+	struct udc_dwc3_ep_data *const ep_data = CONTAINER_OF(ep_cfg, struct udc_dwc3_ep_data, cfg);
+	/* A disabled endpoint's transfer ended in udc_dwc3_ep_disable(). */
+	const bool enabled_ring = USB_EP_GET_IDX(ep_cfg->addr) > 0 && ep_cfg->stat.enabled;
+	k_spinlock_key_t key;
+
+	if (enabled_ring) {
+		udc_dwc3_depcmd_end_xfer(dev, ep_data, UDC_DWC3_DEPCMD_HIPRI_FORCERM);
+	}
+
+	/* Every buffer of the FIFO goes back as aborted, the ones the ring held first. */
+	key = k_spin_lock(&ep_data->lock);
+	if (USB_EP_GET_IDX(ep_cfg->addr) > 0) {
+		udc_dwc3_ring_reset_locked(ep_data);
+	}
 	udc_ep_cancel_queued(dev, ep_cfg);
+	k_spin_unlock(&ep_data->lock, key);
+
 	udc_ep_set_busy(ep_cfg, false);
+
+	/*
+	 * The endpoint stays enabled: start its transfer anew for the buffers to
+	 * come, which Update Transfer adds to the ring and the controller ignores
+	 * without a transfer in progress. A core prior to 3.10a may still be
+	 * ending the old transfer for up to a millisecond, as the Linux driver
+	 * allows for.
+	 */
+	if (enabled_ring) {
+		k_msleep(1);
+		udc_dwc3_trb_nonctrl_init(dev, ep_data);
+		k_work_submit_to_queue(udc_get_work_q(), &ep_data->work);
+	}
 
 	return 0;
 }
@@ -1899,8 +2004,6 @@ static int udc_dwc3_ep_resume(const struct device *const dev,
 			      struct udc_dwc3_ep_data *const ep_data)
 {
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
-	struct net_buf *buf;
-	int ret;
 
 	/* Reset all ongoing transfers on non-control OUT endpoints */
 	if (USB_EP_GET_IDX(ep_data->cfg.addr) > 0) {
@@ -1917,20 +2020,7 @@ static int udc_dwc3_ep_resume(const struct device *const dev,
 	/* Starting from here, the endpoint can be used */
 	sys_set_bits(base + UDC_DWC3_DALEPENA, UDC_DWC3_DALEPENA_USBACTEP(ep_data->epn));
 
-	/* Re-enqueue all the previously dequeued buffers */
-	while (true) {
-		buf = k_fifo_get(&ep_data->requeue_fifo, K_NO_WAIT);
-		if (buf == NULL) {
-			break;
-		}
-
-		ret = udc_dwc3_trb_bulk(dev, ep_data, buf);
-		if (ret != 0) {
-			return ret;
-		}
-	}
-
-	/* We might have blocked transfers earlier */
+	/* The worker arms the buffers of the FIFO again, those the ring held first. */
 	if (USB_EP_GET_IDX(ep_data->cfg.addr) > 0) {
 		k_work_submit_to_queue(udc_get_work_q(), &ep_data->work);
 	}
@@ -1961,8 +2051,7 @@ static int udc_dwc3_ep_disable(const struct device *const dev, struct udc_ep_con
 {
 	struct udc_dwc3_ep_data *ep_data = CONTAINER_OF(ep_cfg, struct udc_dwc3_ep_data, cfg);
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
-	int last_num = CONFIG_UDC_DWC3_TRB_NUM - 1 - 1;
-	struct net_buf *buf;
+	k_spinlock_key_t key;
 
 	LOG_DBG("Disabling EP 0x%02x", ep_cfg->addr);
 
@@ -1974,25 +2063,14 @@ static int udc_dwc3_ep_disable(const struct device *const dev, struct udc_ep_con
 
 	udc_ep_set_busy(ep_cfg, false);
 
-	/* Walk in reverse order to enqueue them in correct order */
-	for (int n = 0; n <= last_num; n++) {
-		buf = ep_data->net_buf[ep_data->head];
-		if (buf != NULL) {
-			k_fifo_put(&ep_data->requeue_fifo, buf);
-		}
-
-		if (ep_data->head > 0) {
-			ep_data->head--;
-		} else {
-			ep_data->head = last_num;
-		}
-	}
-
-	/* Reset the buffers */
+	/*
+	 * The buffers the ring held stay in the endpoint FIFO: the stack's
+	 * dequeue after disabling returns them, or enabling arms them again.
+	 */
+	key = k_spin_lock(&ep_data->lock);
 	memset(ep_data->trb_buf, 0, sizeof(*ep_data->trb_buf) * (CONFIG_UDC_DWC3_TRB_NUM - 1));
-	memset(ep_data->net_buf, 0, sizeof(*ep_data->net_buf) * (CONFIG_UDC_DWC3_TRB_NUM - 1));
-	ep_data->head = ep_data->tail = 0;
-	ep_data->full = false;
+	udc_dwc3_ring_reset_locked(ep_data);
+	k_spin_unlock(&ep_data->lock, key);
 
 	return 0;
 }
@@ -2241,7 +2319,6 @@ static void udc_dwc3_ep_worker(struct k_work *const work)
 {
 	struct udc_dwc3_ep_data *const ep_data = CONTAINER_OF(work, struct udc_dwc3_ep_data, work);
 	const struct device *const dev = ep_data->dev;
-	struct net_buf *buf;
 	int ret;
 
 	LOG_DBG("checking for pending transfers for EP 0x%02x", ep_data->cfg.addr);
@@ -2251,19 +2328,12 @@ static void udc_dwc3_ep_worker(struct k_work *const work)
 		return;
 	}
 
-	while ((buf = udc_buf_peek(&ep_data->cfg)) != NULL) {
-		LOG_INF("Processing buffer %p from queue", (void *)buf);
+	do {
+		ret = udc_dwc3_trb_bulk(dev, ep_data);
+	} while (ret == 0);
 
-		ret = udc_dwc3_trb_bulk(dev, ep_data, buf);
-		if (ret != 0) {
-			LOG_DBG("abort: No more room for buffer");
-			break;
-		}
-
-		LOG_DBG("success: Buffer enqueued");
-
-		udc_buf_get(&ep_data->cfg);
-	}
+	LOG_DBG("EP 0x%02x: %s", ep_data->cfg.addr,
+		ret == -EBUSY ? "no more room for a buffer" : "every buffer armed");
 }
 
 /*
@@ -2349,7 +2419,6 @@ static int udc_dwc3_driver_preinit(const struct device *const dev)
 
 		ep_data = &cfg->ep_data_in[i];
 		k_work_init(&ep_data->work, udc_dwc3_ep_worker);
-		k_fifo_init(&ep_data->requeue_fifo);
 
 		ep_data->dev = dev;
 		ep_data->cfg.addr = USB_EP_DIR_IN | i;
