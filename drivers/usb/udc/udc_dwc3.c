@@ -579,6 +579,8 @@ struct udc_dwc3_data {
 #endif
 	/* Next expected control transfer */
 	atomic_t expected_xfer;
+	/* Serializes arming a control stage between the event worker and the enqueue path */
+	struct k_spinlock ctrl_lock;
 };
 
 /*
@@ -1147,7 +1149,7 @@ static void udc_dwc3_ctrl_try(const struct device *const dev,
 	}
 }
 
-static void udc_dwc3_ctrl_next(const struct device *const dev)
+static void udc_dwc3_ctrl_next_locked(const struct device *const dev)
 {
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
 	const struct udc_dwc3_config *const cfg = dev->config;
@@ -1168,6 +1170,22 @@ static void udc_dwc3_ctrl_next(const struct device *const dev)
 	} else {
 		LOG_INF("No XferNotReady event yet, waiting");
 	}
+}
+
+/*
+ * Called from the event worker and from udc_dwc3_ep_enqueue(), which run on
+ * different threads, possibly on different CPUs: checking that both control
+ * endpoints are idle and arming one is a single step, or both callers could
+ * arm, and the controller refuses the second Start Transfer.
+ */
+static void udc_dwc3_ctrl_next(const struct device *const dev)
+{
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
+	k_spinlock_key_t key = k_spin_lock(&priv->ctrl_lock);
+
+	udc_dwc3_ctrl_next_locked(dev);
+
+	k_spin_unlock(&priv->ctrl_lock, key);
 }
 
 /*
