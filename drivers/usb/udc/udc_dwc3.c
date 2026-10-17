@@ -66,6 +66,7 @@ LOG_MODULE_REGISTER(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
 #define UDC_DWC3_DEPEVT_STREAMEVT(epn)				(((epn) << 1) | (0x06 << 6))
 #define UDC_DWC3_DEPEVT_EPCMDCMPLT(epn)				(((epn) << 1) | (0x07 << 6))
 /* For XferNotReady */
+#define UDC_DWC3_DEPEVT_STATUS_TRANSFER_ACTIVE			BIT(15)
 #define UDC_DWC3_DEPEVT_STATUS_CONTROL_MASK			GENMASK(13, 12)
 #define UDC_DWC3_DEPEVT_STATUS_CONTROL_SETUP			(0x0 << 12)
 #define UDC_DWC3_DEPEVT_STATUS_CONTROL_DATA			(0x1 << 12)
@@ -1499,6 +1500,11 @@ static void udc_dwc3_on_xfer_not_ready_in(const struct device *const dev, const 
 {
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
 
+	/* The stage's TRB is in the controller already: nothing to arm. */
+	if ((evt & UDC_DWC3_DEPEVT_STATUS_TRANSFER_ACTIVE) != 0) {
+		return;
+	}
+
 	switch (evt & UDC_DWC3_DEPEVT_STATUS_CONTROL_MASK) {
 	case UDC_DWC3_DEPEVT_STATUS_CONTROL_SETUP:
 		LOG_ERR("Invalid event (SETUP IN not possible)");
@@ -1519,6 +1525,11 @@ static void udc_dwc3_on_xfer_not_ready_in(const struct device *const dev, const 
 static void udc_dwc3_on_xfer_not_ready_out(const struct device *const dev, const uint32_t evt)
 {
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
+
+	/* The stage's TRB is in the controller already: nothing to arm. */
+	if ((evt & UDC_DWC3_DEPEVT_STATUS_TRANSFER_ACTIVE) != 0) {
+		return;
+	}
 
 	switch (evt & UDC_DWC3_DEPEVT_STATUS_CONTROL_MASK) {
 	case UDC_DWC3_DEPEVT_STATUS_CONTROL_SETUP:
