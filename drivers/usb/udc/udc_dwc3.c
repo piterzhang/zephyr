@@ -1548,11 +1548,9 @@ static void udc_dwc3_on_xfer_not_ready_out(const struct device *const dev, const
 	udc_dwc3_ctrl_next(dev);
 }
 
-static void udc_dwc3_on_xfer_done(const struct device *const dev,
-				  struct udc_dwc3_ep_data *const ep_data)
+/* Report the status of trb, a completed TRB as udc_dwc3_pop_trb() copied it. */
+static void udc_dwc3_on_xfer_done(const struct udc_dwc3_trb *const trb)
 {
-	volatile struct udc_dwc3_trb *const trb = &ep_data->trb_buf[ep_data->tail];
-
 	switch (trb->status & UDC_DWC3_TRB_STATUS_TRBSTS_MASK) {
 	case UDC_DWC3_TRB_STATUS_TRBSTS_OK:
 		break;
@@ -1634,7 +1632,7 @@ static void udc_dwc3_on_xfer_done_nonctrl(const struct device *const dev, const 
 		LOG_DBG("XFER_DONE_NORM: EP 0x%02x, data %p",
 			ep_data->cfg.addr, (void *)buf->data);
 
-		udc_dwc3_on_xfer_done(dev, ep_data);
+		udc_dwc3_on_xfer_done(&trb);
 
 		udc_ep_set_busy(&ep_data->cfg, false);
 
