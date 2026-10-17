@@ -2824,7 +2824,7 @@ static void udc_dwc3_dump_fifo_space(const struct device *dev, const struct shel
 
 	for (size_t n = 0; n < _NUM_FIFO_SPACE; n++) {
 		shell_print(sh, "");
-		shell_print(sh, "FIFO %u", n);
+		shell_print(sh, "FIFO %zu", n);
 
 		for (size_t i = 0; i < ARRAY_SIZE(udc_dwc3_fifo_regs); i++) {
 			avail = udc_dwc3_read_fifo_space(dev, udc_dwc3_fifo_regs[i].type, n);
