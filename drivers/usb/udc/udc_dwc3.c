@@ -1751,7 +1751,7 @@ static void udc_dwc3_handle_event(const struct device *const dev, const uint32_t
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
 	const uint32_t dsts = sys_read32(base + UDC_DWC3_DSTS);
 
-	LOG_WRN("=== %s ===", udc_dwc3_get_event_name(evt, dsts));
+	LOG_DBG("=== %s ===", udc_dwc3_get_event_name(evt, dsts));
 
 	switch (evt & UDC_DWC3_EVT_MASK) {
 	case UDC_DWC3_DEPEVT_XFERCOMPLETE(0):
@@ -1795,7 +1795,7 @@ static void udc_dwc3_handle_event(const struct device *const dev, const uint32_t
 		CODE_UNREACHABLE;
 	}
 
-	LOG_WRN("=== done ===");
+	LOG_DBG("=== done ===");
 }
 
 static void udc_dwc3_event_worker(struct k_work *work)
